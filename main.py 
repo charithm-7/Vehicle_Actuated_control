@@ -1,0 +1,178 @@
+import numpy as np
+import pandas as pd
+import random
+from collections import deque
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, precision_score
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Step 1: Generate and Save Synthetic Data to CSV
+def generate_and_save_data(filename='synthetic_traffic_data.csv', samples=100000):
+    data = []
+    for _ in range(samples):
+        time = np.random.randint(0, 24)
+        time_sin = np.sin(2 * np.pi * time / 24)
+        time_cos = np.cos(2 * np.pi * time / 24)
+        if 7 <= time <= 10 or 17 <= time <= 20:
+            traffic = np.random.randint(600, 1000)
+        elif 11 <= time <= 16:
+            traffic = np.random.randint(300, 600)
+        else:
+            traffic = np.random.randint(100, 300)
+        max_capacity = 1000
+        utilization = traffic / max_capacity
+        congestion = min(100, utilization * 120 + np.random.normal(10, 5))
+        speed = max(5, 80 - congestion * 0.6)
+        vehicle = np.random.randint(0, 3)
+        vehicle_one_hot = [0, 0, 0]
+        vehicle_one_hot[vehicle] = 1
+        action = 1 if congestion > 70 or utilization > 0.85 else 0
+        row = [traffic, speed, congestion, utilization, time_sin, time_cos] + vehicle_one_hot + [action]
+        data.append(row)
+
+    columns = ['traffic', 'speed', 'congestion', 'utilization', 'time_sin', 'time_cos',
+               'vehicle_0', 'vehicle_1', 'vehicle_2', 'action']
+    df = pd.DataFrame(data, columns=columns)
+    df.to_csv(filename, index=False)
+    print(f"Synthetic data saved to {filename}")
+    return filename
+
+# Step 2: Load and Preprocess Data
+def load_and_preprocess(filename):
+    df = pd.read_csv(filename)
+    X = df.drop("action", axis=1).values
+    y = df["action"].values
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(X)
+    return train_test_split(X_scaled, y, test_size=0.2, random_state=42), scaler
+
+# Step 3: Build DQN Model
+def build_model(state_size):
+    model = Sequential([
+        Dense(32, input_dim=state_size, activation='relu'),
+        Dropout(0.3),
+        Dense(16, activation='relu'),
+        Dense(2, activation='linear')
+    ])
+    model.compile(optimizer=Adam(0.0003), loss='mse')
+    return model
+
+# Step 4: Define DQN Agent
+class DQNAgent:
+    def __init__(self, state_size):
+        self.state_size = state_size
+        self.memory = deque(maxlen=10000)
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.995
+        self.batch_size = 128
+        self.model = build_model(state_size)
+        self.target_model = build_model(state_size)
+        self.update_target_model()
+
+    def remember(self, s, a, r, ns):
+        self.memory.append((s, a, r, ns))
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return random.randint(0, 1)
+        q_values = self.model.predict(np.expand_dims(state, axis=0), verbose=0)
+        return np.argmax(q_values[0])
+
+    def replay(self):
+        if len(self.memory) < self.batch_size:
+            return
+        minibatch = random.sample(self.memory, self.batch_size)
+        states = np.array([m[0] for m in minibatch])
+        actions = np.array([m[1] for m in minibatch])
+        rewards = np.array([m[2] for m in minibatch])
+        next_states = np.array([m[3] for m in minibatch])
+
+        target_q = self.model.predict(states, verbose=0)
+        next_q = self.target_model.predict(next_states, verbose=0)
+
+        for i in range(self.batch_size):
+            target_q[i][actions[i]] = rewards[i] + self.gamma * np.max(next_q[i])
+
+        self.model.fit(states, target_q, epochs=1, verbose=0)
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+    def update_target_model(self):
+        self.target_model.set_weights(self.model.get_weights())
+
+# Step 5: Train Agent
+def train_agent(X_train, y_train, episodes=300):
+    agent = DQNAgent(X_train.shape[1])
+    acc_hist, loss_hist = [], []
+
+    for episode in range(episodes):
+        total_correct = 0
+        indices = np.random.randint(0, len(X_train), size=agent.batch_size)
+
+        for i in indices:
+            state = X_train[i]
+            true_action = int(y_train[i])
+            pred_action = agent.act(state)
+            reward = 1 if pred_action == true_action else -1
+            if pred_action == true_action:
+                total_correct += 1
+            agent.remember(state, pred_action, reward, state)
+
+        agent.replay()
+
+        accuracy = total_correct / agent.batch_size
+        acc_hist.append(accuracy)
+
+        # Create Q-values as labels based on rewards (as used in training)
+        states = X_train[indices]
+        q_values = agent.model.predict(states, verbose=0)
+        next_q = agent.target_model.predict(states, verbose=0)
+
+        for i, idx in enumerate(indices):
+            true_action = int(y_train[idx])
+            reward = 1 if np.argmax(q_values[i]) == true_action else -1
+            q_values[i][true_action] = reward + agent.gamma * np.max(next_q[i])
+
+        loss = agent.model.evaluate(states, q_values, verbose=0)
+        loss_hist.append(loss)
+
+        if episode % 50 == 0:
+            agent.update_target_model()
+            print(f"Episode {episode} - Epsilon: {agent.epsilon:.3f} - Accuracy: {accuracy:.4f}")
+
+        if agent.epsilon < 0.1:
+            print("Early stopping (low epsilon).")
+            break
+
+    agent.model.save("traffic_dqn_model.keras")
+    print("Model saved as traffic_dqn_model.keras")
+    return agent, acc_hist, loss_hist
+
+# Step 6: Test Model and Save Predictions
+def test_model(X_test, y_test):
+    model = load_model("traffic_dqn_model.keras")
+    y_pred = np.argmax(model.predict(X_test, verbose=0), axis=1)
+    acc = accuracy_score(y_test, y_pred) * 100
+    print(f"\nAccuracy: {acc:.2f}%")
+    print("Classification Report:\n", classification_report(y_test, y_pred))
+
+    # Save predictions to CSV
+    df_results = pd.DataFrame({"Actual": y_test, "Predicted": y_pred})
+    df_results.to_csv("prediction_results.csv", index=False)
+    print("Predictions saved to prediction_results.csv")
+
+    return y_pred
+
+# Step 7: Run Full Pipeline
+csv_file = generate_and_save_data()
+(X_train, X_test, y_train, y_test), scaler = load_and_preprocess(csv_file)
+agent, acc_hist, loss_hist = train_agent(X_train, y_train, episodes=500)
+y_pred = test_model(X_test, y_test)
