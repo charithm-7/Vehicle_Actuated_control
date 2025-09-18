@@ -12,4 +12,3 @@ In this project, Traffic camera imagery and deep learning are used to construct 
 
 ---
 
-## 📁 Project Structure
